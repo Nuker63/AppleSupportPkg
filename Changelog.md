@@ -1,8 +1,18 @@
 AppleSupport Changelog
 ======================
+#### v2.1.7
+- Added unaligned and custom-size I/O support
+
+#### v2.1.6
+- Added SSE2 support in memory intrinsics for better performance
+- Added AudioDxe to the list of bundled drivers
+- Switch to merged OpenCorePkg instead of OcSupportPkg
+
 #### v2.1.5
 - Fixed assertions in AppleUsbKbDxe driver
 - Moved FwRuntimeServices driver to OcSupportPkg and bundle with OpenCore
+- Moved VerifyMsrE2 tool to OcSupportPkg and bundle with OpenCore
+- Moved AppleUsbKbDxe driver to OcSupportPkg and bundle with OpenCore
 
 #### v2.1.4
 - Added workaround for V to NV variable upgrade in FwRuntimeServices

@@ -19,6 +19,7 @@ WITHOUT WARRANTIES OR REPRESENTATIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED.
 #include <AppleSupportPkgVersion.h>
 #include <Uefi/UefiGpt.h>
 #include <Guid/OcVariables.h>
+#include <Guid/AppleApfsInfo.h>
 #include <Library/DebugLib.h>
 #include <Library/BaseMemoryLib.h>
 #include <Library/DevicePathLib.h>
@@ -28,6 +29,8 @@ WITHOUT WARRANTIES OR REPRESENTATIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED.
 #include <Library/UefiRuntimeServicesTableLib.h>
 #include <Library/OcAppleImageVerificationLib.h>
 #include <Library/OcBootManagementLib.h>
+#include <Library/OcConsoleLib.h>
+#include <Library/OcFileLib.h>
 #include <Protocol/BlockIo.h>
 #include <Protocol/DiskIo.h>
 #include <Protocol/BlockIo2.h>
@@ -43,7 +46,7 @@ WITHOUT WARRANTIES OR REPRESENTATIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED.
 #include "EfiComponentName.h"
 
 STATIC BOOLEAN  LegacyScan       = FALSE;
-STATIC UINT64   LegacyBaseOffset = 0;
+STATIC UINT64   LegacyBaseLBA    = 0;
 
 UINT64
 ApfsBlockChecksumCalculate (
@@ -52,21 +55,29 @@ ApfsBlockChecksumCalculate (
   )
 {
   UINTN         Index;
-  UINT64        Sum1 = 0;
-  UINT64        Check1 = 0;
-  UINT64        Sum2 = 0;
-  UINT64        Check2 = 0;
-  CONST UINT64  ModValue = 0xFFFFFFFF;
+  UINT64        Sum1;
+  UINT64        Check1;
+  UINT64        Sum2;
+  UINT64        Check2;
+  UINT32        Remainder;
+  CONST UINT32  ModValue = 0xFFFFFFFF;
+
+  Sum1 = 0;
+  Sum2 = 0;
 
   for (Index = 0; Index < DataSize / sizeof (UINT32); Index++) {
-    Sum1 = ((Sum1 + (UINT64)Data[Index]) % ModValue);
-    Sum2 = (Sum2 + Sum1) % ModValue;
+    DivU64x32Remainder (Sum1 + Data[Index], ModValue, &Remainder);
+    Sum1 = Remainder;
+    DivU64x32Remainder (Sum2 + Sum1, ModValue, &Remainder);
+    Sum2 = Remainder;
   }
 
-  Check1 = ModValue - ((Sum1 + Sum2) % ModValue);
-  Check2 = ModValue - ((Sum1 + Check1) % ModValue);
+  DivU64x32Remainder (Sum1 + Sum2, ModValue, &Remainder);
+  Check1 = ModValue - Remainder;
+  DivU64x32Remainder (Sum1 + Check1, ModValue, &Remainder);
+  Check2 = ModValue - Remainder;
 
-  return (Check2 << 32) | Check1;
+  return (Check2 << 32U) | Check1;
 }
 
 //
@@ -201,43 +212,6 @@ StartApfsDriver (
   return EFI_SUCCESS;
 }
 
-STATIC
-EFI_STATUS
-ReadDisk (
-  IN EFI_DISK_IO_PROTOCOL   *DiskIo,
-  IN EFI_DISK_IO2_PROTOCOL  *DiskIo2,
-  IN UINT32                 MediaId,
-  IN UINT64                 Offset,
-  IN UINTN                  BufferSize,
-  OUT UINT8                 *Buffer
-  )
-{
-  EFI_STATUS  Status;
-
-  if (DiskIo2 != NULL) {
-    Status = DiskIo2->ReadDiskEx (
-      DiskIo2,
-      MediaId,
-      Offset,
-      NULL,
-      BufferSize,
-      Buffer
-      );
-  } else if (DiskIo != NULL) {
-      Status = DiskIo->ReadDisk (
-        DiskIo,
-        MediaId,
-        Offset,
-        BufferSize,
-        Buffer
-        );
-    } else {
-      Status = EFI_UNSUPPORTED;
-    }
-
-  return Status;
-}
-
 //
 // Function to parse GPT entries in legacy
 //
@@ -245,108 +219,34 @@ EFI_STATUS
 EFIAPI
 LegacyApfsContainerScan (
   IN EFI_DRIVER_BINDING_PROTOCOL  *This,
-  IN EFI_HANDLE                   ControllerHandle
+  IN EFI_HANDLE                   ControllerHandle,
+  IN OC_DISK_CONTEXT              *DiskContext
   )
 {
   EFI_STATUS                  Status;
   UINTN                       Index               = 0;
   UINT8                       *Block              = NULL;
-  UINTN                       Lba                 = 0;
+  UINT64                      Lba                 = 0;
   UINT32                      PartitionNumber     = 0;
   UINT32                      PartitionEntrySize  = 0;
   EFI_PARTITION_TABLE_HEADER  *GptHeader          = NULL;
-  UINT32                      MediaId             = 0;
-  UINT32                      BlockSize           = 0;
-  EFI_BLOCK_IO_PROTOCOL       *BlockIo            = NULL;
-  EFI_BLOCK_IO2_PROTOCOL      *BlockIo2           = NULL;
-  EFI_DISK_IO_PROTOCOL        *DiskIo             = NULL;
-  EFI_DISK_IO2_PROTOCOL       *DiskIo2            = NULL;
   EFI_PARTITION_ENTRY         *ApfsGptEntry       = NULL;
 
   DEBUG ((DEBUG_VERBOSE, "LegacyApfsContainerScan: Entrypoint\n"));
-
-  //
-  // Open I/O protocols
-  //
-  Status = gBS->OpenProtocol (
-    ControllerHandle,
-    &gEfiBlockIo2ProtocolGuid,
-    (VOID **) &BlockIo2,
-    This->DriverBindingHandle,
-    ControllerHandle,
-    EFI_OPEN_PROTOCOL_GET_PROTOCOL
-    );
-
-  if (EFI_ERROR (Status)) {
-    BlockIo2 = NULL;
-
-    Status = gBS->OpenProtocol (
-      ControllerHandle,
-      &gEfiBlockIoProtocolGuid,
-      (VOID **) &BlockIo,
-      This->DriverBindingHandle,
-      ControllerHandle,
-      EFI_OPEN_PROTOCOL_GET_PROTOCOL
-      );
-
-    if (EFI_ERROR (Status)) {
-      DEBUG ((DEBUG_VERBOSE, "LegacyApfsContainerScan: BlockIO protocol not present\n"));
-      return EFI_UNSUPPORTED;
-    }
-  }
-
-  Status = gBS->OpenProtocol (
-    ControllerHandle,
-    &gEfiDiskIo2ProtocolGuid,
-    (VOID **) &DiskIo2,
-    This->DriverBindingHandle,
-    ControllerHandle,
-    EFI_OPEN_PROTOCOL_GET_PROTOCOL
-    );
-
-  if (EFI_ERROR (Status)) {
-    DiskIo2 = NULL;
-    Status = gBS->OpenProtocol (
-      ControllerHandle,
-      &gEfiDiskIoProtocolGuid,
-      (VOID **) &DiskIo,
-      This->DriverBindingHandle,
-      ControllerHandle,
-      EFI_OPEN_PROTOCOL_GET_PROTOCOL
-      );
-
-    if (EFI_ERROR (Status)){
-      DEBUG ((DEBUG_VERBOSE, "LegacyApfsContainerScan: DiskIO protocol not present\n"));
-      return EFI_UNSUPPORTED;
-    }
-  }
-
-  if (BlockIo2 != NULL) {
-    BlockSize     = BlockIo2->Media->BlockSize;
-    MediaId       = BlockIo2->Media->MediaId;
-  } else if (BlockIo != NULL) {
-      BlockSize     = BlockIo->Media->BlockSize;
-      MediaId       = BlockIo->Media->MediaId;
-    } else {
-      return EFI_UNSUPPORTED;
-    }
-
-  DEBUG ((DEBUG_VERBOSE, "BlockSize: %lu", BlockSize));
-  Block = AllocateZeroPool ((UINTN) BlockSize);
+  DEBUG ((DEBUG_VERBOSE, "BlockSize: %lu", DiskContext->BlockSize));
+  Block = AllocateZeroPool ((UINTN) DiskContext->BlockSize);
   if (Block == NULL) {
-    DEBUG ((DEBUG_ERROR, "LegacyApfsContainerScan: Allocation error %r\n", Status));
+    DEBUG ((DEBUG_ERROR, "LegacyApfsContainerScan: Allocation error\n"));
     return EFI_OUT_OF_RESOURCES;
   }
 
   //
   // Read GPT header first.
   //
-  Status = ReadDisk (
-    DiskIo,
-    DiskIo2,
-    MediaId,
-    BlockSize,
-    BlockSize,
+  Status = OcDiskRead (
+    DiskContext,
+    1,
+    DiskContext->BlockSize,
     Block
     );
 
@@ -386,11 +286,9 @@ LegacyApfsContainerScan (
     return EFI_UNSUPPORTED;
   }
 
- Status = ReadDisk (
-    DiskIo,
-    DiskIo2,
-    MediaId,
-    MultU64x32 (Lba, BlockSize),
+ Status = OcDiskRead (
+    DiskContext,
+    Lba,
     PartitionNumber * PartitionEntrySize,
     Block
     );
@@ -421,7 +319,7 @@ LegacyApfsContainerScan (
     DEBUG ((DEBUG_VERBOSE, "LegacyApfsContainerScan: ApfsGptEntry is null\n", Status));
     return EFI_UNSUPPORTED;
   }
-  LegacyBaseOffset = MultU64x32 (ApfsGptEntry->StartingLBA, BlockSize);
+  LegacyBaseLBA = ApfsGptEntry->StartingLBA;
   FreePool(Block);
 
   return EFI_SUCCESS;
@@ -509,6 +407,7 @@ ApfsDriverLoaderSupported (
   EFI_STATUS                    Status;
   APPLE_PARTITION_INFO_PROTOCOL *ApplePartitionInfo          = NULL;
   EFI_PARTITION_INFO_PROTOCOL   *Edk2PartitionInfo           = NULL;
+  OC_DISK_CONTEXT               DiskContext;
 
   Status = CheckOpenCoreScanPolicy (ControllerHandle);
   if (EFI_ERROR (Status)) {
@@ -528,61 +427,13 @@ ApfsDriverLoaderSupported (
     return EFI_UNSUPPORTED;
    }
 
-  //
-  // We check for both DiskIO and BlockIO protocols.
-  // Both V1 and V2.
-  //
-
-  Status = gBS->OpenProtocol (
-    ControllerHandle,
-    &gEfiDiskIo2ProtocolGuid,
-    NULL,
-    This->DriverBindingHandle,
-    ControllerHandle,
-    EFI_OPEN_PROTOCOL_TEST_PROTOCOL
-    );
-
+  Status = OcDiskInitializeContext (&DiskContext, ControllerHandle, TRUE, TRUE);
   if (EFI_ERROR (Status)) {
-    Status = gBS->OpenProtocol (
-      ControllerHandle,
-      &gEfiDiskIoProtocolGuid,
-      NULL,
-      This->DriverBindingHandle,
-      ControllerHandle,
-      EFI_OPEN_PROTOCOL_TEST_PROTOCOL
-      );
-  }
-
-  if (EFI_ERROR (Status)) {
-    return Status;
-  }
-
-  Status = gBS->OpenProtocol (
-    ControllerHandle,
-    &gEfiBlockIo2ProtocolGuid,
-    NULL,
-    This->DriverBindingHandle,
-    ControllerHandle,
-    EFI_OPEN_PROTOCOL_TEST_PROTOCOL
-    );
-
-  if (EFI_ERROR (Status)) {
-    Status = gBS->OpenProtocol(
-      ControllerHandle,
-      &gEfiBlockIoProtocolGuid,
-      NULL,
-      This->DriverBindingHandle,
-      ControllerHandle,
-      EFI_OPEN_PROTOCOL_TEST_PROTOCOL
-      );
-  }
-
-  if (EFI_ERROR(Status)) {
-    return Status;
+    return EFI_UNSUPPORTED;
   }
 
   if (LegacyScan) {
-    return LegacyApfsContainerScan (This, ControllerHandle);
+    return LegacyApfsContainerScan (This, ControllerHandle, &DiskContext);
   }
 
   //
@@ -685,15 +536,10 @@ ApfsDriverLoaderStart (
   EFI_STATUS                        Status;
   UINTN                             Index                        = 0;
   UINTN                             CurPos                       = 0;
-  EFI_BLOCK_IO_PROTOCOL             *BlockIo                     = NULL;
-  EFI_BLOCK_IO2_PROTOCOL            *BlockIo2                    = NULL;
-  EFI_DISK_IO_PROTOCOL              *DiskIo                      = NULL;
-  EFI_DISK_IO2_PROTOCOL             *DiskIo2                     = NULL;
   UINT32                            ApfsBlockSize                = 0;
-  UINT32                            MediaId                      = 0;
   UINT8                             *ApfsBlock                   = NULL;
   EFI_GUID                          ContainerUuid;
-  UINT64                            EfiBootRecordBlockOffset     = 0;
+  UINT64                            EfiBootRecordBlockLBA        = 0;
   UINT64                            EfiBootRecordBlockPtr        = 0;
   APFS_EFI_BOOT_RECORD              *EfiBootRecordBlock          = NULL;
   APFS_CSB                          *ContainerSuperBlock         = NULL;
@@ -702,6 +548,7 @@ ApfsDriverLoaderStart (
   UINTN                             EfiFileCurrentExtentSize     = 0;
   APFS_DRIVER_INFO_PRIVATE_DATA     *Private                     = NULL;
   APFS_EFIBOOTRECORD_LOCATION_INFO  *EfiBootRecordLocationInfo   = NULL;
+  OC_DISK_CONTEXT                   DiskContext;
 
   Status = gBS->OpenProtocol (
     ControllerHandle,
@@ -718,64 +565,15 @@ ApfsDriverLoaderStart (
 
   DEBUG ((DEBUG_VERBOSE, "Apfs Container found.\n"));
 
-  //
-  // Open I/O protocols
-  //
-  Status = gBS->OpenProtocol (
+  Status = OcDiskInitializeContext (
+    &DiskContext,
     ControllerHandle,
-    &gEfiBlockIo2ProtocolGuid,
-    (VOID **) &BlockIo2,
-    This->DriverBindingHandle,
-    ControllerHandle,
-    EFI_OPEN_PROTOCOL_GET_PROTOCOL
+    TRUE,
+    TRUE
     );
 
   if (EFI_ERROR (Status)) {
-    BlockIo2 = NULL;
-
-    Status = gBS->OpenProtocol (
-      ControllerHandle,
-      &gEfiBlockIoProtocolGuid,
-      (VOID **) &BlockIo,
-      This->DriverBindingHandle,
-      ControllerHandle,
-      EFI_OPEN_PROTOCOL_GET_PROTOCOL
-      );
-
-    if (EFI_ERROR (Status)) {
-      return EFI_UNSUPPORTED;
-    }
-  }
-
-  Status = gBS->OpenProtocol (
-    ControllerHandle,
-    &gEfiDiskIo2ProtocolGuid,
-    (VOID **) &DiskIo2,
-    This->DriverBindingHandle,
-    ControllerHandle,
-    EFI_OPEN_PROTOCOL_GET_PROTOCOL
-    );
-
-  if (EFI_ERROR (Status)) {
-    DiskIo2 = NULL;
-    Status = gBS->OpenProtocol (
-      ControllerHandle,
-      &gEfiDiskIoProtocolGuid,
-      (VOID **) &DiskIo,
-      This->DriverBindingHandle,
-      ControllerHandle,
-      EFI_OPEN_PROTOCOL_GET_PROTOCOL
-      );
-
-    if (EFI_ERROR (Status)) {
-      return EFI_UNSUPPORTED;
-    }
-  }
-
-  if (BlockIo2 != NULL) {
-    MediaId       = BlockIo2->Media->MediaId;
-  } else {
-    MediaId       = BlockIo->Media->MediaId;
+    return EFI_UNSUPPORTED;
   }
 
   ApfsBlock = AllocateZeroPool (2048);
@@ -786,11 +584,9 @@ ApfsDriverLoaderStart (
   //
   // Read ContainerSuperblock and get ApfsBlockSize.
   //
-  Status = ReadDisk (
-    DiskIo,
-    DiskIo2,
-    MediaId,
-    LegacyBaseOffset,
+  Status = OcDiskRead (
+    &DiskContext,
+    LegacyBaseLBA,
     2048,
     ApfsBlock
     );
@@ -862,11 +658,9 @@ ApfsDriverLoaderStart (
   //
   // Read full ContainerSuperblock with known BlockSize.
   //
-  Status = ReadDisk (
-    DiskIo,
-    DiskIo2,
-    MediaId,
-    LegacyBaseOffset,
+  Status = OcDiskRead (
+    &DiskContext,
+    LegacyBaseLBA,
     ApfsBlockSize,
     ApfsBlock
     );
@@ -893,23 +687,23 @@ ApfsDriverLoaderStart (
   //
   // Calculate Offset of EfiBootRecordBlock
   //
-  EfiBootRecordBlockOffset = MultU64x32 (EfiBootRecordBlockPtr, ApfsBlockSize)
-                              + LegacyBaseOffset;
+  EfiBootRecordBlockLBA = DivU64x32 (
+    MultU64x32 (EfiBootRecordBlockPtr, ApfsBlockSize),
+    DiskContext.BlockSize
+    ) + LegacyBaseLBA;
 
   DEBUG ((
     DEBUG_VERBOSE,
-    "EfiBootRecordBlock offset: %08llx \n",
-     EfiBootRecordBlockOffset
+    "EfiBootRecordBlock LBA: %08llx \n",
+     EfiBootRecordBlockLBA
      ));
 
   //
   // Read EfiBootRecordBlock.
   //
-  Status = ReadDisk (
-    DiskIo,
-    DiskIo2,
-    MediaId,
-    EfiBootRecordBlockOffset,
+  Status = OcDiskRead (
+    &DiskContext,
+    EfiBootRecordBlockLBA,
     ApfsBlockSize,
     ApfsBlock
     );
@@ -963,9 +757,9 @@ ApfsDriverLoaderStart (
     EfiFileCurrentExtentOffset = MultU64x32 (
                                 EfiBootRecordBlock->RecordExtents[Index].StartPhysicalAddr,
                                 ApfsBlockSize
-                                )  + LegacyBaseOffset;
+                                ) + LegacyBaseLBA * DiskContext.BlockSize;
 
-    EfiFileCurrentExtentSize = MultU64x32 (
+    EfiFileCurrentExtentSize = (UINTN) MultU64x32 (
                                 EfiBootRecordBlock->RecordExtents[Index].BlockCount,
                                 ApfsBlockSize
                                 );
@@ -986,11 +780,9 @@ ApfsDriverLoaderStart (
     //
     // Read current extent
     //
-    Status = ReadDisk (
-      DiskIo,
-      DiskIo2,
-      MediaId,
-      EfiFileCurrentExtentOffset,
+    Status = OcDiskRead (
+      &DiskContext,
+      DivU64x32 (EfiFileCurrentExtentOffset, DiskContext.BlockSize),
       EfiFileCurrentExtentSize,
       EfiFileBuffer + CurPos
       );
@@ -1100,21 +892,6 @@ ApfsDriverLoaderStart (
   if (Private != NULL) {
     FreePool (Private);
   }
-  if (DiskIo2 != NULL) {
-    gBS->CloseProtocol (
-      ControllerHandle,
-      &gEfiDiskIo2ProtocolGuid,
-      This->DriverBindingHandle,
-      ControllerHandle
-      );
-  } else {
-    gBS->CloseProtocol (
-      ControllerHandle,
-      &gEfiDiskIoProtocolGuid,
-      This->DriverBindingHandle,
-      ControllerHandle
-      );
-  }
 
   return EFI_SUCCESS;
 }
@@ -1156,24 +933,12 @@ ApfsDriverLoaderStop (
     EFI_OPEN_PROTOCOL_GET_PROTOCOL
     );
 
-  if (EFI_ERROR (Status)) {
-    Status = gBS->CloseProtocol (
-      ControllerHandle,
-      &gEfiDiskIoProtocolGuid,
-      This->DriverBindingHandle,
-      ControllerHandle
-      );
-    Status = gBS->CloseProtocol (
-      ControllerHandle,
-      &gEfiDiskIo2ProtocolGuid,
-      This->DriverBindingHandle,
-      ControllerHandle
-      );
-  } else {
+  if (!EFI_ERROR (Status)) {
     Status = gBS->UninstallMultipleProtocolInterfaces (
       EfiBootRecordLocationInfo->ControllerHandle,
       &gApfsEfiBootRecordInfoProtocolGuid,
-      EfiBootRecordLocationInfo
+      EfiBootRecordLocationInfo,
+      NULL
       );
   }
 
@@ -1216,10 +981,10 @@ EFIAPI
 ApfsDriverLoaderInit (
   IN EFI_HANDLE        ImageHandle,
   IN EFI_SYSTEM_TABLE  *SystemTable
-)
+  )
 {
   EFI_STATUS                          Status;
-  VOID                                *PartitionInfoInterface = NULL;
+  VOID                                *PartitionInfoInterface;
 
   DEBUG ((
     DEBUG_INFO,
@@ -1251,7 +1016,7 @@ ApfsDriverLoaderInit (
     }
   }
 
-  if (EFI_ERROR(Status)) {
+  if (EFI_ERROR (Status)) {
     DEBUG ((
       DEBUG_VERBOSE,
       "No partition info protocol, using Legacy scan\n"
